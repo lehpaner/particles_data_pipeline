@@ -1,0 +1,47 @@
+# TSI Particle Counter — application configuration
+# Loaded once at startup by config.py. Override the file path with the
+# TSI_CONFIG_PATH environment variable.
+#
+# Secrets are NOT stored here — set TSI_CLIENT_SECRET / TSI_SESSION_SECRET
+# as environment variables instead.
+
+app:
+  host: "0.0.0.0"
+  port: 8080
+  reload: true
+  log_level: "INFO"
+
+database:
+  # "sqlite" (default, zero-config, file at `path`) or "postgresql"
+  # (requires the `psycopg2-binary` package and the `postgres:` section below).
+  driver: "sqlite"
+  path: "database/tsi_data.db"
+
+  # Only used when driver = "postgresql". Password is intentionally left
+  # blank here — set it via the TSI_PG_PASSWORD environment variable.
+  postgres:
+    host: "localhost"
+    port: 5432
+    dbname: "localhost"
+    user: "postgres"
+    password: "sranje"
+    sslmode: "prefer"
+    schema: "bpfc"
+
+cors:
+  allow_origins:
+    - "http://localhost:8080"
+
+auth:
+  client_id: "ec1dc751-6a1b-4537-bd9c-4d82dafbc726"
+  tenant_id: "77985f42-f997-4d8b-8474-c2a5c621de04"
+  redirect_uri: "http://localhost:8080/msgraph/oauth/callback"
+  scopes: "openid profile email offline_access"
+  session_ttl_hours: 8
+
+scheduler:
+  poll_interval_seconds: 10
+
+instrument:
+  default_port: 502
+  default_timeout: 3.0

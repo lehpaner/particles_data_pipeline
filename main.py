@@ -14,9 +14,15 @@ Authentication:
     4. Callback exchanges code, validates id_token, sets signed session cookie
     5. Browser lands on /  — now authenticated, sees the dashboard
 
-Environment variables:
+Configuration:
+    App-level settings (host/port, DB path, CORS origins, Entra client/tenant
+    IDs, scheduler poll interval, ...) are read from config.yaml at startup.
+    Override the file location with TSI_CONFIG_PATH. See config.py.
+
+Environment variables (secrets only — never stored in config.yaml):
     TSI_CLIENT_SECRET   Azure app client secret (required in confidential client mode)
     TSI_SESSION_SECRET  32+ char string for cookie encryption (recommended in production)
+    TSI_CONFIG_PATH     Path to an alternate config.yaml (optional)
 """
 
 import asyncio
@@ -30,13 +36,18 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from db.localDB import (
+from config import CONFIG
+from db.database import (
     init_db, db_session,
     list_devices, get_device, get_records_page,
     get_channels_for_record, get_record_count,
     save_device_data, start_sync_log, finish_sync_log,
+    get_or_create_device, reset_device_records,
+    get_channel_stats, get_sync_log, record_belongs_to_device,
 )
 from instrument.tsi_modbus import TSIClient
 from backthread.scheduler import (
@@ -44,14 +55,18 @@ from backthread.scheduler import (
     _next_run, _now_utc, _iso, _parse_iso,
 )
 from backthread.workflow import WorkflowGraph, TEMPLATES
+from db.localDB import db_session as scheduler_db_session  # scheduler_jobs/scheduler_runs
+                                                             # always live in the local SQLite
+                                                             # file (see backthread/scheduler.py),
+                                                             # independent of database.driver.
 import auth
 
-logging.basicConfig(level=logging.INFO,
+logging.basicConfig(level=CONFIG.app.log_level,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("tsi_api")
 
-DB_PATH = Path("database/tsi_data.db")
-APP_PORT = 8080
+DB_PATH = CONFIG.db_path
+APP_PORT = CONFIG.app.port
 
 # ─── Public routes (no auth check) ───────────────────────────────────────────
 PUBLIC_PATHS = {
@@ -94,7 +109,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8080"],
+    allow_origins=CONFIG.cors.allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -139,9 +154,6 @@ def _parse_json_fields(d: dict, *fields) -> dict:
             except Exception:
                 pass
     return d
-
-def _current_user(request: Request) -> auth.UserSession:
-    return getattr(request.state, "user", None)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -268,277 +280,6 @@ def _auth_error_page(code: str, message: str) -> HTMLResponse:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# LANDING PAGE (protected)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@app.get("/", response_class=HTMLResponse, include_in_schema=False)
-async def root(request: Request):
-    user = _current_user(request)
-    name  = user.name  if user else "Unknown"
-    email = user.email if user else ""
-
-    return HTMLResponse(f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TSI Particle Counter — Dashboard</title>
-<style>
-/* ── reset & base ─────────────────────────────────────────────────────────── */
-*,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
-:root{{
-  --bg:#f0f4f8;--surface:#fff;--border:#e2e8f0;
-  --primary:#1a3a5c;--primary-light:#2563a8;--accent:#0ea5e9;
-  --text:#1e293b;--muted:#64748b;--danger:#dc2626;--warn:#d97706;
-  --ok:#16a34a;--radius:10px;--shadow:0 2px 12px #0001;
-}}
-body{{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);
-      color:var(--text);min-height:100vh;}}
-
-/* ── top-bar ──────────────────────────────────────────────────────────────── */
-.topbar{{
-  background:var(--primary);color:#fff;
-  display:flex;align-items:center;justify-content:space-between;
-  padding:0 24px;height:56px;position:sticky;top:0;z-index:100;
-  box-shadow:0 2px 8px #0003;
-}}
-.topbar-brand{{display:flex;align-items:center;gap:10px;font-weight:700;font-size:1.05rem;}}
-.topbar-brand span{{opacity:.7;font-weight:400;font-size:.85rem;}}
-.user-chip{{
-  display:flex;align-items:center;gap:10px;font-size:.875rem;
-}}
-.avatar{{
-  width:32px;height:32px;border-radius:50%;
-  background:var(--accent);color:#fff;
-  display:flex;align-items:center;justify-content:center;
-  font-weight:700;font-size:.8rem;flex-shrink:0;
-}}
-.user-info{{display:flex;flex-direction:column;line-height:1.2;text-align:right;}}
-.user-email{{opacity:.6;font-size:.75rem;}}
-.logout-btn{{
-  margin-left:14px;padding:5px 14px;border-radius:6px;
-  background:rgba(255,255,255,.15);color:#fff;text-decoration:none;
-  font-size:.8rem;border:1px solid rgba(255,255,255,.25);
-  transition:background .15s;
-}}
-.logout-btn:hover{{background:rgba(255,255,255,.28);}}
-
-/* ── layout ───────────────────────────────────────────────────────────────── */
-.main{{max-width:1120px;margin:0 auto;padding:28px 20px 60px;}}
-
-.grid-2{{display:grid;grid-template-columns:1fr 1fr;gap:18px;}}
-@media(max-width:700px){{.grid-2{{grid-template-columns:1fr;}}}}
-
-/* ── cards ────────────────────────────────────────────────────────────────── */
-.card{{
-  background:var(--surface);border-radius:var(--radius);
-  padding:22px 24px;box-shadow:var(--shadow);border:1px solid var(--border);
-}}
-.card-title{{
-  font-size:.7rem;font-weight:700;letter-spacing:.08em;
-  text-transform:uppercase;color:var(--muted);margin-bottom:14px;
-}}
-.section-label{{
-  font-size:.7rem;font-weight:700;letter-spacing:.08em;
-  text-transform:uppercase;color:var(--muted);
-  margin:28px 0 12px;border-bottom:1px solid var(--border);padding-bottom:6px;
-}}
-
-/* ── stat row ─────────────────────────────────────────────────────────────── */
-.stat-row{{display:flex;gap:14px;flex-wrap:wrap;}}
-.stat{{
-  flex:1;min-width:120px;background:var(--bg);border-radius:8px;
-  padding:14px 16px;border:1px solid var(--border);
-}}
-.stat-val{{font-size:1.8rem;font-weight:700;color:var(--primary);line-height:1;}}
-.stat-lbl{{font-size:.75rem;color:var(--muted);margin-top:4px;}}
-
-/* ── endpoint table ───────────────────────────────────────────────────────── */
-.ep-table{{width:100%;border-collapse:collapse;font-size:.83rem;}}
-.ep-table thead tr{{background:var(--primary);color:#fff;}}
-.ep-table th{{padding:8px 12px;text-align:left;font-weight:600;font-size:.72rem;
-              letter-spacing:.04em;text-transform:uppercase;}}
-.ep-table td{{padding:7px 12px;border-bottom:1px solid var(--border);vertical-align:top;}}
-.ep-table tr:last-child td{{border-bottom:none;}}
-.ep-table tr:hover td{{background:#f8fafc;}}
-.ep-group td{{background:#f0f5ff!important;font-weight:700;font-size:.72rem;
-              letter-spacing:.05em;text-transform:uppercase;color:var(--primary-light);
-              padding:6px 12px;}}
-code{{
-  background:#eef3ff;color:#1e40af;padding:1px 6px;
-  border-radius:4px;font-size:.8rem;font-family:ui-monospace,monospace;
-}}
-
-/* ── badges ───────────────────────────────────────────────────────────────── */
-.badge{{
-  display:inline-block;padding:1px 8px;border-radius:20px;
-  font-size:.68rem;font-weight:700;letter-spacing:.04em;
-  text-transform:uppercase;white-space:nowrap;
-}}
-.get  {{background:#dcfce7;color:#15803d;}}
-.post {{background:#dbeafe;color:#1d4ed8;}}
-.patch{{background:#fef9c3;color:#a16207;}}
-.del  {{background:#fee2e2;color:#b91c1c;}}
-
-/* ── quick-links ──────────────────────────────────────────────────────────── */
-.links{{display:flex;gap:10px;flex-wrap:wrap;}}
-.link-btn{{
-  padding:8px 16px;border-radius:7px;text-decoration:none;font-size:.85rem;
-  font-weight:600;border:1.5px solid var(--primary);color:var(--primary);
-  transition:all .15s;
-}}
-.link-btn:hover{{background:var(--primary);color:#fff;}}
-.link-btn.filled{{background:var(--primary);color:#fff;}}
-.link-btn.filled:hover{{background:var(--primary-light);border-color:var(--primary-light);}}
-
-/* ── scheduler badge ──────────────────────────────────────────────────────── */
-.sched-on{{color:var(--ok);font-weight:700;}}
-.sched-off{{color:var(--danger);font-weight:700;}}
-</style>
-</head>
-<body>
-
-<!-- ── TOP BAR ─────────────────────────────────────────────────────────────── -->
-<div class="topbar">
-  <div class="topbar-brand">
-    🌬️ TSI Particle Counter
-    <span>/ Dashboard</span>
-  </div>
-  <div class="user-chip">
-    <div class="user-info">
-      <span>{name}</span>
-      <span class="user-email">{email}</span>
-    </div>
-    <div class="avatar">{name[:1].upper() if name else "?"}</div>
-    <a href="/auth/logout" class="logout-btn">Sign out</a>
-  </div>
-</div>
-
-<!-- ── MAIN ────────────────────────────────────────────────────────────────── -->
-<div class="main">
-
-  <!-- quick links -->
-  <div style="margin-bottom:20px" class="links">
-    <a href="/docs"   class="link-btn filled">📖 Swagger UI</a>
-    <a href="/redoc"  class="link-btn">📘 ReDoc</a>
-    <a href="/scheduler/status" class="link-btn">⚙️ Scheduler status</a>
-    <a href="/devices"          class="link-btn">🔌 Devices JSON</a>
-  </div>
-
-  <!-- live stats injected by JS -->
-  <div class="card" style="margin-bottom:18px">
-    <div class="card-title">Live — Scheduler &amp; Devices</div>
-    <div class="stat-row" id="stats">
-      <div class="stat"><div class="stat-val" id="s-devices">—</div><div class="stat-lbl">Devices</div></div>
-      <div class="stat"><div class="stat-val" id="s-jobs">—</div><div class="stat-lbl">Enabled jobs</div></div>
-      <div class="stat"><div class="stat-val" id="s-runs">—</div><div class="stat-lbl">Total runs</div></div>
-      <div class="stat"><div class="stat-val" id="s-fail">—</div><div class="stat-lbl">Failures</div></div>
-      <div class="stat"><div class="stat-val" id="s-sched">—</div><div class="stat-lbl">Scheduler</div></div>
-    </div>
-  </div>
-
-  <div class="grid-2">
-
-    <!-- ── LEFT: endpoint reference ──────────────────────────────────────── -->
-    <div class="card" style="grid-column:1/-1">
-      <div class="card-title">API Reference</div>
-      <table class="ep-table">
-        <thead><tr><th>Method</th><th>Path</th><th>Description</th></tr></thead>
-        <tbody>
-
-        <tr class="ep-group"><td colspan="3">📋 Data &amp; Sync</td></tr>
-        <tr><td><span class="badge get">GET</span></td><td><code>/devices</code></td><td>List devices in DB</td></tr>
-        <tr><td><span class="badge get">GET</span></td><td><code>/devices/{{id}}</code></td><td>Device info</td></tr>
-        <tr><td><span class="badge get">GET</span></td><td><code>/devices/{{id}}/status</code></td><td>Live status from instrument</td></tr>
-        <tr><td><span class="badge get">GET</span></td><td><code>/devices/{{id}}/records</code></td><td>Paginated samples (filter by date)</td></tr>
-        <tr><td><span class="badge get">GET</span></td><td><code>/devices/{{id}}/records/{{rid}}/channels</code></td><td>Particle channels for sample</td></tr>
-        <tr><td><span class="badge get">GET</span></td><td><code>/devices/{{id}}/stats</code></td><td>Aggregate stats per channel</td></tr>
-        <tr><td><span class="badge get">GET</span></td><td><code>/sync_log</code></td><td>Sync history</td></tr>
-        <tr><td><span class="badge post">POST</span></td><td><code>/connect</code></td><td>Connect instrument &amp; read data</td></tr>
-        <tr><td><span class="badge post">POST</span></td><td><code>/devices/{{id}}/sync</code></td><td>Re-sync device</td></tr>
-        <tr><td><span class="badge get">GET</span></td><td><code>/devices/{{id}}/sync/stream</code></td><td>Sync progress (SSE)</td></tr>
-
-        <tr class="ep-group"><td colspan="3">🔬 Measurement Control</td></tr>
-        <tr><td><span class="badge post">POST</span></td><td><code>/devices/{{id}}/measure/start</code></td><td>Start manual measurement (CMD 3)</td></tr>
-        <tr><td><span class="badge post">POST</span></td><td><code>/devices/{{id}}/measure/stop</code></td><td>Stop measurement (CMD 4+7)</td></tr>
-        <tr><td><span class="badge post">POST</span></td><td><code>/devices/{{id}}/measure/start_auto</code></td><td>Start auto cycle from recipe (CMD 6)</td></tr>
-        <tr><td><span class="badge post">POST</span></td><td><code>/devices/{{id}}/measure/stop_auto</code></td><td>Cancel auto cycle (CMD 7)</td></tr>
-        <tr><td><span class="badge post">POST</span></td><td><code>/devices/{{id}}/measure/start_pump</code></td><td>Start pump / pre-sampling (CMD 2)</td></tr>
-        <tr><td><span class="badge post">POST</span></td><td><code>/devices/{{id}}/measure/stop_pump</code></td><td>Stop pump (CMD 5)</td></tr>
-
-        <tr class="ep-group"><td colspan="3">🔧 Maintenance</td></tr>
-        <tr><td><span class="badge post">POST</span></td><td><code>/devices/{{id}}/maintenance/clear_data?confirm=true</code></td><td>⚠️ Erase all records from instrument (CMD 1)</td></tr>
-        <tr><td><span class="badge post">POST</span></td><td><code>/devices/{{id}}/maintenance/sync_clock</code></td><td>Sync instrument clock (CMD 8)</td></tr>
-        <tr><td><span class="badge post">POST</span></td><td><code>/devices/{{id}}/maintenance/purge</code></td><td>Optical purge (CMD 30)</td></tr>
-        <tr><td><span class="badge post">POST</span></td><td><code>/devices/{{id}}/maintenance/silence</code></td><td>Silence alarm (CMD 14)</td></tr>
-        <tr><td><span class="badge post">POST</span></td><td><code>/devices/{{id}}/maintenance/unsilence</code></td><td>Restore alarm (CMD 15)</td></tr>
-        <tr><td><span class="badge post">POST</span></td><td><code>/devices/{{id}}/maintenance/disable_local_control</code></td><td>Lock front panel (CMD 12)</td></tr>
-        <tr><td><span class="badge post">POST</span></td><td><code>/devices/{{id}}/maintenance/enable_local_control</code></td><td>Unlock front panel (CMD 13)</td></tr>
-        <tr><td><span class="badge post">POST</span></td><td><code>/devices/{{id}}/maintenance/reboot?confirm=true</code></td><td>⚠️ Reboot instrument (CMD 29)</td></tr>
-
-        <tr class="ep-group"><td colspan="3">📐 Workflow Graphs</td></tr>
-        <tr><td><span class="badge get">GET</span></td><td><code>/workflow/templates</code></td><td>Built-in workflow templates</td></tr>
-        <tr><td><span class="badge post">POST</span></td><td><code>/workflow/validate</code></td><td>Validate graph without running</td></tr>
-
-        <tr class="ep-group"><td colspan="3">🕐 Scheduler</td></tr>
-        <tr><td><span class="badge post">POST</span></td><td><code>/scheduler/jobs</code></td><td>Create scheduled job</td></tr>
-        <tr><td><span class="badge get">GET</span></td><td><code>/scheduler/jobs</code></td><td>List jobs</td></tr>
-        <tr><td><span class="badge get">GET</span></td><td><code>/scheduler/jobs/{{id}}</code></td><td>Job detail</td></tr>
-        <tr><td><span class="badge patch">PATCH</span></td><td><code>/scheduler/jobs/{{id}}</code></td><td>Update job (graph / schedule / enable)</td></tr>
-        <tr><td><span class="badge del">DELETE</span></td><td><code>/scheduler/jobs/{{id}}</code></td><td>Delete job</td></tr>
-        <tr><td><span class="badge post">POST</span></td><td><code>/scheduler/jobs/{{id}}/enable</code></td><td>Enable job</td></tr>
-        <tr><td><span class="badge post">POST</span></td><td><code>/scheduler/jobs/{{id}}/disable</code></td><td>Disable job</td></tr>
-        <tr><td><span class="badge post">POST</span></td><td><code>/scheduler/jobs/{{id}}/trigger</code></td><td>Run immediately (409 if device busy)</td></tr>
-        <tr><td><span class="badge get">GET</span></td><td><code>/scheduler/runs</code></td><td>Run history (filter by job/device/outcome)</td></tr>
-        <tr><td><span class="badge get">GET</span></td><td><code>/scheduler/runs/{{id}}</code></td><td>Full run record + log</td></tr>
-        <tr><td><span class="badge get">GET</span></td><td><code>/scheduler/runs/{{id}}/report</code></td><td>Structured JSON report</td></tr>
-        <tr><td><span class="badge get">GET</span></td><td><code>/scheduler/status</code></td><td>Daemon status &amp; next due jobs</td></tr>
-
-        <tr class="ep-group"><td colspan="3">🔐 Authentication (Microsoft Entra)</td></tr>
-        <tr><td><span class="badge get">GET</span></td><td><code>/auth/login</code></td><td>Redirect to Microsoft login</td></tr>
-        <tr><td><span class="badge get">GET</span></td><td><code>/auth/logout</code></td><td>Clear session &amp; MS logout</td></tr>
-        <tr><td><span class="badge get">GET</span></td><td><code>/msgraph/oauth/callback</code></td><td>OAuth2 redirect URI (Entra callback)</td></tr>
-
-        </tbody>
-      </table>
-    </div>
-
-  </div><!-- /grid-2 -->
-</div><!-- /main -->
-
-<script>
-// Fetch live stats from scheduler/status + /devices
-async function loadStats() {{
-  try {{
-    const [sched, devs] = await Promise.all([
-      fetch('/scheduler/status').then(r=>r.json()),
-      fetch('/devices').then(r=>r.json()),
-    ]);
-    document.getElementById('s-devices').textContent = devs.length;
-    document.getElementById('s-jobs').textContent    = sched.enabled_jobs ?? '—';
-    document.getElementById('s-runs').textContent    = sched.total_runs   ?? '—';
-    document.getElementById('s-fail').textContent    = sched.failed_runs  ?? '—';
-    const el = document.getElementById('s-sched');
-    if(sched.running) {{
-      el.textContent = '● ON';
-      el.className   = 'stat-val sched-on';
-    }} else {{
-      el.textContent = '○ OFF';
-      el.className   = 'stat-val sched-off';
-    }}
-  }} catch(e) {{
-    console.warn('Stats fetch failed', e);
-  }}
-}}
-loadStats();
-setInterval(loadStats, 15000);
-</script>
-
-</body></html>
-""")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # ALL EXISTING API ROUTES (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -619,11 +360,7 @@ async def api_get_records(
 @app.get("/devices/{device_id}/records/{record_id}/channels")
 async def api_get_channels(device_id: int, record_id: int):
     with db_session(DB_PATH) as conn:
-        rec = conn.execute(
-            "SELECT id FROM records WHERE id=? AND device_id=?",
-            (record_id, device_id)
-        ).fetchone()
-        if not rec:
+        if not record_belongs_to_device(conn, record_id, device_id):
             raise HTTPException(404, detail="Record not found")
         rows = get_channels_for_record(conn, record_id)
     return [row_to_dict(r) for r in rows]
@@ -635,28 +372,13 @@ async def api_stats(device_id: int,
     with db_session(DB_PATH) as conn:
         if not get_device(conn, device_id):
             raise HTTPException(404, detail="Device not found")
-        q = """
-            SELECT ch.channel_idx, ch.size_um,
-                   COUNT(ch.id) AS samples, SUM(ch.count) AS total_count,
-                   AVG(ch.count) AS avg_count, MAX(ch.count) AS max_count,
-                   MIN(ch.count) AS min_count, SUM(ch.alarm) AS alarm_events
-            FROM channels ch JOIN records r ON r.id=ch.record_id
-            WHERE r.device_id=?"""
-        params = [device_id]
-        if from_ts: q += " AND r.timestamp>=?"; params.append(from_ts)
-        if to_ts:   q += " AND r.timestamp<=?"; params.append(to_ts)
-        q += " GROUP BY ch.channel_idx, ch.size_um ORDER BY ch.channel_idx"
-        rows = conn.execute(q, params).fetchall()
+        rows = get_channel_stats(conn, device_id, from_ts, to_ts)
     return [row_to_dict(r) for r in rows]
 
 @app.get("/sync_log")
 async def api_sync_log(limit: int = Query(50, ge=1, le=500)):
     with db_session(DB_PATH) as conn:
-        rows = conn.execute("""
-            SELECT sl.*, d.ip, d.model FROM sync_log sl
-            LEFT JOIN devices d ON d.id=sl.device_id
-            ORDER BY sl.started_at DESC LIMIT ?
-        """, (limit,)).fetchall()
+        rows = get_sync_log(conn, limit)
     return [row_to_dict(r) for r in rows]
 
 
@@ -684,11 +406,7 @@ async def api_connect(req: ConnectRequest, background_tasks: BackgroundTasks):
     except OSError as e:
         raise HTTPException(503, detail=f"Instrument unreachable: {e}")
     with db_session(DB_PATH) as conn:
-        conn.execute("INSERT OR IGNORE INTO devices (ip,port,last_seen) VALUES(?,?,?)",
-                     (req.ip, req.port, datetime.utcnow().isoformat()))
-        row = conn.execute("SELECT id FROM devices WHERE ip=? AND port=?",
-                           (req.ip, req.port)).fetchone()
-        device_id = row["id"]
+        device_id = get_or_create_device(conn, req.ip, req.port)
     _sync_progress[device_id] = {"status": "running", "done": 0, "total": 0}
     def _task():
         try:
@@ -798,8 +516,7 @@ async def api_clear_data(device_id: int, confirm: bool = Query(False), timeout: 
     result = _run_command(device_id, lambda c: c.clear_all_data(), timeout)
     if result["success"]:
         with db_session(DB_PATH) as conn:
-            conn.execute("UPDATE devices SET total_records=0, last_sync=? WHERE id=?",
-                         (datetime.utcnow().isoformat(), device_id))
+            reset_device_records(conn, device_id)
     return result
 
 @app.post("/devices/{device_id}/maintenance/sync_clock")
@@ -871,7 +588,7 @@ async def api_create_job(req: JobCreateRequest):
             raise HTTPException(404, detail="Device not found")
     next_run = _parse_iso(req.first_run_at) if req.first_run_at else _now_utc()
     now = _iso(_now_utc())
-    with db_session(DB_PATH) as conn:
+    with scheduler_db_session(DB_PATH) as conn:
         cur = conn.execute("""
             INSERT INTO scheduler_jobs
               (device_id,name,description,graph_json,enabled,
@@ -885,7 +602,7 @@ async def api_create_job(req: JobCreateRequest):
 
 @app.get("/scheduler/jobs")
 async def api_list_jobs(device_id: Optional[int] = Query(None), enabled_only: bool = Query(False)):
-    with db_session(DB_PATH) as conn:
+    with scheduler_db_session(DB_PATH) as conn:
         q, params, conds = "SELECT * FROM scheduler_jobs", [], []
         if device_id is not None: conds.append("device_id=?"); params.append(device_id)
         if enabled_only:           conds.append("enabled=1")
@@ -902,7 +619,7 @@ async def api_list_jobs(device_id: Optional[int] = Query(None), enabled_only: bo
 
 @app.get("/scheduler/jobs/{job_id}")
 async def api_get_job(job_id: int):
-    with db_session(DB_PATH) as conn:
+    with scheduler_db_session(DB_PATH) as conn:
         row = conn.execute("SELECT * FROM scheduler_jobs WHERE id=?", (job_id,)).fetchone()
         if not row: raise HTTPException(404, detail="Job not found")
         d = dict(row)
@@ -913,7 +630,7 @@ async def api_get_job(job_id: int):
 
 @app.patch("/scheduler/jobs/{job_id}")
 async def api_update_job(job_id: int, req: JobUpdateRequest):
-    with db_session(DB_PATH) as conn:
+    with scheduler_db_session(DB_PATH) as conn:
         row = conn.execute("SELECT * FROM scheduler_jobs WHERE id=?", (job_id,)).fetchone()
         if not row: raise HTTPException(404, detail="Job not found")
         upd: dict = {}
@@ -941,7 +658,7 @@ async def api_update_job(job_id: int, req: JobUpdateRequest):
 
 @app.delete("/scheduler/jobs/{job_id}")
 async def api_delete_job(job_id: int):
-    with db_session(DB_PATH) as conn:
+    with scheduler_db_session(DB_PATH) as conn:
         if not conn.execute("SELECT id FROM scheduler_jobs WHERE id=?", (job_id,)).fetchone():
             raise HTTPException(404, detail="Job not found")
         conn.execute("DELETE FROM scheduler_jobs WHERE id=?", (job_id,))
@@ -949,21 +666,21 @@ async def api_delete_job(job_id: int):
 
 @app.post("/scheduler/jobs/{job_id}/enable")
 async def api_enable_job(job_id: int):
-    with db_session(DB_PATH) as conn:
+    with scheduler_db_session(DB_PATH) as conn:
         conn.execute("UPDATE scheduler_jobs SET enabled=1, updated_at=? WHERE id=?",
                      (_iso(_now_utc()), job_id))
     return {"job_id": job_id, "enabled": True}
 
 @app.post("/scheduler/jobs/{job_id}/disable")
 async def api_disable_job(job_id: int):
-    with db_session(DB_PATH) as conn:
+    with scheduler_db_session(DB_PATH) as conn:
         conn.execute("UPDATE scheduler_jobs SET enabled=0, updated_at=? WHERE id=?",
                      (_iso(_now_utc()), job_id))
     return {"job_id": job_id, "enabled": False}
 
 @app.post("/scheduler/jobs/{job_id}/trigger")
 async def api_trigger_job(job_id: int):
-    with db_session(DB_PATH) as conn:
+    with scheduler_db_session(DB_PATH) as conn:
         if not conn.execute("SELECT id FROM scheduler_jobs WHERE id=?", (job_id,)).fetchone():
             raise HTTPException(404, detail="Job not found")
     if not get_scheduler().trigger_now(job_id):
@@ -981,7 +698,7 @@ async def api_list_runs(
     limit:     int           = Query(50, ge=1, le=500),
     skip:      int           = Query(0, ge=0),
 ):
-    with db_session(DB_PATH) as conn:
+    with scheduler_db_session(DB_PATH) as conn:
         q = "SELECT r.*, j.name as job_name FROM scheduler_runs r LEFT JOIN scheduler_jobs j ON j.id=r.job_id"
         params, conds = [], []
         if job_id    is not None: conds.append("r.job_id=?");    params.append(job_id)
@@ -1002,7 +719,7 @@ async def api_list_runs(
 
 @app.get("/scheduler/runs/{run_id}")
 async def api_get_run(run_id: int):
-    with db_session(DB_PATH) as conn:
+    with scheduler_db_session(DB_PATH) as conn:
         row = conn.execute("""
             SELECT r.*, j.name as job_name, j.description as job_description
             FROM scheduler_runs r LEFT JOIN scheduler_jobs j ON j.id=r.job_id
@@ -1017,7 +734,7 @@ async def api_get_run(run_id: int):
 
 @app.get("/scheduler/runs/{run_id}/report")
 async def api_get_run_report(run_id: int):
-    with db_session(DB_PATH) as conn:
+    with scheduler_db_session(DB_PATH) as conn:
         row = conn.execute("SELECT report_json FROM scheduler_runs WHERE id=?", (run_id,)).fetchone()
         if not row or not row["report_json"]:
             raise HTTPException(404, detail="Run or report not found")
@@ -1026,7 +743,7 @@ async def api_get_run_report(run_id: int):
 @app.get("/scheduler/status")
 async def api_scheduler_status():
     sched = get_scheduler()
-    with db_session(DB_PATH) as conn:
+    with scheduler_db_session(DB_PATH) as conn:
         tj   = conn.execute("SELECT COUNT(*) FROM scheduler_jobs").fetchone()[0]
         ej   = conn.execute("SELECT COUNT(*) FROM scheduler_jobs WHERE enabled=1").fetchone()[0]
         rr   = conn.execute("SELECT COUNT(*) FROM scheduler_runs WHERE outcome='running'").fetchone()[0]
@@ -1044,8 +761,37 @@ async def api_scheduler_status():
     }
 
 
+# ─── Frontend (React/Vite build) ──────────────────────────────────────────────
+#
+# Serves frontend/dist (built via `npm run build`, outDir set to ../dist) as
+# a static SPA: index.html at "/", hashed assets under "/assets", favicon.svg
+# etc. at the root. Mounted last so it never shadows the API routes above.
+#
+# StaticFiles(html=True) alone only serves index.html for the mount root —
+# a deep link like /instrument (no such file on disk) 404s instead of
+# reaching the client-side router. SPAStaticFiles falls back to index.html
+# for any path that isn't a real file, so TanStack Router can take over.
+
+class SPAStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope):
+        try:
+            return await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            if exc.status_code == 404:
+                return await super().get_response("index.html", scope)
+            raise
+
+
+FRONTEND_DIST = Path(__file__).resolve().parent / "dist"
+
+if FRONTEND_DIST.is_dir():
+    app.mount("/", SPAStaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
+else:
+    log.warning(f"Frontend build not found at {FRONTEND_DIST} — run `npm run build` in frontend/")
+
+
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=APP_PORT, reload=True)
+    uvicorn.run("main:app", host=CONFIG.app.host, port=APP_PORT, reload=CONFIG.app.reload)

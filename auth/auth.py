@@ -23,12 +23,9 @@ Public routes (no auth required):
 
 All other routes require a valid session cookie.
 
-Azure app registration details (from caller):
-  Client ID  : ec1dc751-6a1b-4537-bd9c-4d82dafbc726
-  Tenant ID  : 77985f42-f997-4d8b-8474-c2a5c621de04
+Azure app registration details (client_id/tenant_id/redirect_uri/scopes are
+read from config.yaml — see the `auth:` section):
   Object ID  : ba081e11-a8b1-4ff2-bea0-be0a4901c24a   (service principal)
-  Redirect   : http://localhost:8080/msgraph/oauth/callback
-  Scopes     : openid profile email offline_access
 """
 
 import base64
@@ -44,14 +41,16 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Optional
 
+from config import CONFIG
+
 log = logging.getLogger("auth")
 
-# ─── Configuration ────────────────────────────────────────────────────────────
+# ─── Configuration (non-secret values come from config.yaml) ────────────────
 
-CLIENT_ID    = "ec1dc751-6a1b-4537-bd9c-4d82dafbc726"
-TENANT_ID    = "77985f42-f997-4d8b-8474-c2a5c621de04"
-REDIRECT_URI = "http://localhost:8080/msgraph/oauth/callback"
-SCOPES       = "openid profile email offline_access"
+CLIENT_ID    = CONFIG.auth.client_id
+TENANT_ID    = CONFIG.auth.tenant_id
+REDIRECT_URI = CONFIG.auth.redirect_uri
+SCOPES       = CONFIG.auth.scopes
 
 AUTHORITY    = f"https://login.microsoftonline.com/{TENANT_ID}"
 AUTH_URL     = f"{AUTHORITY}/oauth2/v2.0/authorize"
@@ -62,7 +61,7 @@ USERINFO_URL = "https://graph.microsoft.com/oidc/userinfo"
 
 SESSION_COOKIE   = "tsi_session"
 STATE_COOKIE     = "tsi_oauth_state"
-SESSION_TTL      = 8 * 3600   # 8 hours in seconds
+SESSION_TTL      = int(CONFIG.auth.session_ttl_hours * 3600)
 
 # Session encryption key — read from env or derive a stable dev key.
 # In production set TSI_SESSION_SECRET to a 32-byte hex string.
@@ -289,7 +288,7 @@ def read_session_cookie(token: str) -> Optional[UserSession]:
     return UserSession(**payload)
 
 
-def build_logout_url(post_logout_redirect: str = "http://localhost:8080/") -> str:
+def build_logout_url(post_logout_redirect: str = f"http://localhost:{CONFIG.app.port}/") -> str:
     params = {
         "client_id":                CLIENT_ID,
         "post_logout_redirect_uri": post_logout_redirect,

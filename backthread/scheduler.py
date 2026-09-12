@@ -25,10 +25,11 @@ from typing import Optional
 from db.localDB import db_session, get_device, DB_PATH
 from instrument.tsi_modbus import TSIClient
 from backthread.workflow import WorkflowGraph, run_workflow
+from config import CONFIG
 
 log = logging.getLogger("scheduler")
 
-POLL_INTERVAL = 10          # seconds between DB polls
+POLL_INTERVAL = CONFIG.scheduler.poll_interval_seconds   # seconds between DB polls
 MAX_DEVICE_TIMEOUT = 60.0   # socket timeout for scheduler connections
 
 

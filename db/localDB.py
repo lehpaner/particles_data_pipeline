@@ -16,8 +16,9 @@ from pathlib import Path
 from typing import Optional, List
 
 from instrument.tsi_modbus import TSIDevice, TSIRecord
+from config import CONFIG
 
-DB_PATH = Path("database/tsi_data.db")   # canonical path, imported by other modules
+DB_PATH = CONFIG.db_path   # canonical path, imported by other modules
 
 
 def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
@@ -274,6 +275,59 @@ def get_record_count(conn: sqlite3.Connection, device_id: int) -> int:
     row = conn.execute("SELECT COUNT(*) as c FROM records WHERE device_id=?",
                        (device_id,)).fetchone()
     return row["c"] if row else 0
+
+
+# ─── Misc helpers used by the API layer ───────────────────────────────────────
+
+def get_or_create_device(conn: sqlite3.Connection, ip: str, port: int) -> int:
+    """Ensures a devices row exists for (ip, port) and returns its id."""
+    conn.execute(
+        "INSERT OR IGNORE INTO devices (ip, port, last_seen) VALUES (?, ?, ?)",
+        (ip, port, datetime.utcnow().isoformat()),
+    )
+    row = conn.execute("SELECT id FROM devices WHERE ip=? AND port=?", (ip, port)).fetchone()
+    return row["id"]
+
+
+def reset_device_records(conn: sqlite3.Connection, device_id: int):
+    """Zeroes total_records after a clear_all_data() maintenance command."""
+    conn.execute(
+        "UPDATE devices SET total_records=0, last_sync=? WHERE id=?",
+        (datetime.utcnow().isoformat(), device_id),
+    )
+
+
+def get_channel_stats(conn: sqlite3.Connection, device_id: int,
+                      from_ts: Optional[str] = None, to_ts: Optional[str] = None) -> List[sqlite3.Row]:
+    q = """
+        SELECT ch.channel_idx, ch.size_um,
+               COUNT(ch.id) AS samples, SUM(ch.count) AS total_count,
+               AVG(ch.count) AS avg_count, MAX(ch.count) AS max_count,
+               MIN(ch.count) AS min_count, SUM(ch.alarm) AS alarm_events
+        FROM channels ch JOIN records r ON r.id=ch.record_id
+        WHERE r.device_id=?"""
+    params: list = [device_id]
+    if from_ts:
+        q += " AND r.timestamp>=?"; params.append(from_ts)
+    if to_ts:
+        q += " AND r.timestamp<=?"; params.append(to_ts)
+    q += " GROUP BY ch.channel_idx, ch.size_um ORDER BY ch.channel_idx"
+    return conn.execute(q, params).fetchall()
+
+
+def get_sync_log(conn: sqlite3.Connection, limit: int = 50) -> List[sqlite3.Row]:
+    return conn.execute("""
+        SELECT sl.*, d.ip, d.model FROM sync_log sl
+        LEFT JOIN devices d ON d.id=sl.device_id
+        ORDER BY sl.started_at DESC LIMIT ?
+    """, (limit,)).fetchall()
+
+
+def record_belongs_to_device(conn: sqlite3.Connection, record_id: int, device_id: int) -> bool:
+    row = conn.execute(
+        "SELECT id FROM records WHERE id=? AND device_id=?", (record_id, device_id)
+    ).fetchone()
+    return row is not None
 
 
 # ─── Sync log ─────────────────────────────────────────────────────────────────

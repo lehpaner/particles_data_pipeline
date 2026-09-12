@@ -18,3 +18,7 @@ penv/
 # Editor
 .vscode/
 .idea/
+
+# Frontend (built via frontend/, output lands here per vite.config.js outDir)
+dist/
+frontend/node_modules/
